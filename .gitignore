@@ -1,0 +1,16 @@
+# ESP-IDF build artifacts
+build/
+build_test/
+sdkconfig
+sdkconfig.old
+sdkconfig.ci*
+
+# Component manager artifacts (fetch + local patches, see patches/)
+managed_components/
+version.txt
+
+# editor/OS noise
+.vscode/
+.idea/
+.DS_Store
+*.swp

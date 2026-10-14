@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>ESP32-S3 Spectrometer</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body{background:#111;color:#ddd;font:14px monospace;margin:0;padding:12px}
+h1{font-size:16px;margin:4px 0 10px;color:#8cf;font-weight:normal}
+#wrap{max-width:720px;margin:0 auto}
+canvas{background:#000;border:1px solid #333;width:100%;cursor:crosshair;touch-action:none}
+.row{display:flex;gap:10px;align-items:center;margin:8px 0;flex-wrap:wrap}
+label{min-width:170px;display:flex;justify-content:space-between}
+input[type=range]{width:120px}
+button,a button{background:#234;color:#cde;border:0;padding:6px 10px;cursor:pointer;font:inherit}
+a{text-decoration:none}
+#st,#cal,#st2{color:#7a7;font-size:12px;margin:4px 0}
+#cal{color:#fc6}
+</style>
+</head>
+<body>
+<div id="wrap">
+<h1>ESP32-S3 Spectrometer <span id="st"></span></h1>
+<canvas id="cv" width="640" height="300"></canvas>
+<div id="st2"></div>
+<div id="cal"><span id="cp"></span> <span id="cur" style="color:#9cf"></span></div>
+<div class="row"><button id="sell">sel left</button> <button id="selr">sel right</button> <button id="calapply">apply cal</button> <button id="calcancel">cancel</button> <button id="calreset">reset cal</button></div>
+<div class="row">left px &#8594; nm <input id="nm1" type="number" value="400" style="width:80px"> right px &#8594; nm <input id="nm2" type="number" value="532" style="width:80px"></div>
+<div class="row"><label>peak width <span id="v_md">20</span></label><input type="range" id="md" min="1" max="100" value="20"></div>
+<div class="row"><label>threshold % <span id="v_th">10</span></label><input type="range" id="th" min="0" max="100" value="10"></div>
+<div class="row"><label>filter order <span id="v_or">9</span></label><input type="range" id="or" min="0" max="15" value="9"></div>
+<div class="row"><label>gain &times;<span id="v_g">6</span></label><input type="range" id="g" min="1" max="50" value="6"></div>
+<div class="row"><label>zoom &times;<span id="v_z">1</span></label><input type="range" id="z" min="1" max="8" step="0.25" value="1"></div>
+<div class="row"><label>pan <span id="v_p">0</span></label><input type="range" id="p" min="-320" max="320" value="0"></div>
+<div class="row"><label style="color:#8f8">raw YUY2 <input type="checkbox" id="raw"> <span id="v_raw">(no JPEG, ~2-3 fps)</span></label></div>
+<div class="row"><label>exposure &micro;s <span id="v_exp">auto</span></label><input type="range" id="exp" min="0" max="200000" step="1000" value="0"></div>
+<div class="row">
+<button id="hold">peak hold: off</button>
+<button id="rhold">reset hold</button>
+<a href="/snapshot.png" target="_blank"><button>snapshot PNG</button></a>
+<a href="/snapshot.csv" target="_blank"><button>snapshot CSV</button></a>
+</div>
+<details style="margin-top:8px">
+<summary style="cursor:pointer;color:#8cf">WiFi setup (reboots to that network)</summary>
+<div class="row"><input type="text" id="ssid" placeholder="SSID" style="width:160px"></div>
+<div class="row"><input type="password" id="pass" placeholder="password" style="width:160px"></div>
+<div class="row"><button id="netsave">save + connect</button><span id="netst"></span></div>
+</details>
+</div>
+<script>
+var cv=document.getElementById('cv'),cx=cv.getContext('2d');
+var DATA={n:0,int:[],peaks:[],cal:[72,405,304,532],md:20,th:10,or:9,g:6,hold:false};
+/* client-only view state: kept OUT of DATA because tick() replaces the
+ * whole DATA object every 150 ms poll */
+var VIEW={z:1,p:0};
+function $(id){return document.getElementById(id)}
+function wl2rgb(w){
+  var R=0,G=0,B=0,f=1;
+  if(w<=439){R=(440-w)/60;B=1}
+  else if(w<=489){G=(w-440)/50;B=1}
+  else if(w<=509){G=1;B=(510-w)/20}
+  else if(w<=579){R=(w-510)/70;G=1}
+  else if(w<=644){R=1;G=(645-w)/65}
+  else{R=1}
+  if(w<=419)f=0.3+0.7*(w-380)/40;
+  else if(w>700)f=0.3+0.7*(780-w)/80;
+  function g(x){x=x*f;return x<=0?0:Math.pow(Math.max(0,Math.min(1,x)),0.8)*255}
+  return [g(R),g(G),g(B)];
+}
+/* FIXED nm axis: 1250nm (left edge) .. 22nm (right edge) — the sensor's
+ * optical dispersion (635nm @ px201, 570nm @ px222 extrapolate to exactly
+ * this). Independent of the (optional) calibration — the sensor can't see
+ * beyond this, so the full-scale ruler always shows it. */
+var NM0=1250,NM1=22;
+function wlOf(x){return NM0+(NM1-NM0)*x/Math.max(1,DATA.n)}
+/* viewport transform, refreshed by draw(); read by the cursor handler */
+var gX0=0,gSpan=1;
+function clampIdx(i,n){return Math.min(n-1,Math.max(0,i))}
+function draw(){
+  var H=300, GY=280, W=640;
+  cx.fillStyle='#000';cx.fillRect(0,0,W,H);
+  var n=DATA.n;
+  if(n<1){gX0=0;gSpan=1;return}
+  /* zoom is centered on the canvas middle; pan shifts the center */
+  var z=Math.max(1,VIEW.z);
+  var span=n/z;
+  var center=n/2+(VIEW.p||0);
+  if(span<n)center=Math.min(n-span/2,Math.max(span/2,center));
+  else center=n/2;
+  gX0=center-span/2;gSpan=span;
+  function sx(i){return (i-gX0)/span*W}
+  function nmX(w){return sx((w-NM0)/(NM1-NM0)*n)}
+  var w;
+  for(w=300;w<=1200;w+=50){
+    var x=nmX(w);
+    if(x<-1||x>W+1)continue;
+    cx.strokeStyle=(w%100===0)?'#555':'#222';
+    cx.beginPath();cx.moveTo(x,0);cx.lineTo(x,GY);cx.stroke();
+  }
+  cx.strokeStyle='#888';cx.beginPath();cx.moveTo(0,GY);cx.lineTo(W,GY);cx.stroke();
+  cx.fillStyle='#999';cx.font='11px monospace';
+  for(w=250;w<=1250;w+=100){var x=nmX(w);if(x>-14&&x<W+14)cx.fillText(''+w,x-10,GY+14)}
+  cx.fillText('nm',W-38,GY+14);
+  var g=Math.max(1,DATA.g||6);
+  var bw=Math.max(1,Math.ceil(W/span));
+  var i0=Math.max(0,Math.floor(gX0)),i1=Math.min(n,Math.ceil(gX0+span));
+  /* FULL SCALE: every sensor pixel is drawn. Calibration only positions the
+   * nm ruler/labels on top — it must never change the range shown.
+   * Out-of-visible-band colors clamp to the visible edges (380/780nm). */
+  for(var i=i0;i<i1;i++){
+    var cnm=Math.max(380,Math.min(780,wlOf(i)));
+    var x=sx(i);
+    var rgb=wl2rgb(cnm),v=Math.min(GY,Math.round(DATA.int[i]*g));
+    cx.fillStyle='rgb('+Math.round(rgb[0])+','+Math.round(rgb[1])+','+Math.round(rgb[2])+')';
+    cx.fillRect(x,GY-v,bw,v);
+  }
+  for(i=0;i<DATA.peaks.length;i++){
+    var p=DATA.peaks[i],x=sx(p.px);
+    if(x<-3||x>W+3)continue;
+    cx.strokeStyle='#fc6';cx.beginPath();cx.moveTo(x,0);cx.lineTo(x,GY);cx.stroke();
+    /* calibrated nm from the device (cal applies to the spectrum shown);
+     * with no cal the fixed-ruler value is the best estimate */
+    var lnm=(DATA.cal[0]&&isFinite(p.nm))?p.nm:wlOf(p.px);
+    cx.fillStyle='#fc6';cx.fillText(Math.round(lnm)+'nm ('+Math.round(p.val)+')',x+3,10);
+  }
+  /* picked calibration points (pixel-space markers) */
+  if(calref.p1!==null){var xm=sx(clampIdx(calref.p1,n));cx.strokeStyle='#6cf';cx.beginPath();cx.moveTo(xm,0);cx.lineTo(xm,GY);cx.stroke();}
+  if(calref.p2!==null){var xm=sx(clampIdx(calref.p2,n));cx.strokeStyle='#f80';cx.beginPath();cx.moveTo(xm,0);cx.lineTo(xm,GY);cx.stroke();}
+  $('st').textContent='fmt='+DATA.fmt+' '+(DATA.w||0)+'x'+(DATA.h||0)+'@'+(DATA.fps||0)+
+    ' frames='+DATA.frames+' '+(DATA.stream?'streaming':'waiting')+' net='+DATA.net+' ip='+DATA.ip;
+  $('st2').textContent='peaks: '+DATA.peaks.map(function(p){
+    var lnm=(DATA.cal[0]&&isFinite(p.nm))?p.nm:wlOf(p.px);
+    return Math.round(lnm)+'nm'}).join('  ');
+}
+var calMode=null;            /* null | 'left' | 'right': next canvas click binds */
+var calref={p1:null,p2:null};
+var cpHoldUntil=0;           /* cal-flow messages outlive the 150 ms tick */
+function cpMsg(s,h){$('cp').textContent=s;cpHoldUntil=Date.now()+(h||3000)}
+function calClear(){calMode=null;calref.p1=null;calref.p2=null}
+$('sell').onclick=function(){calMode='left';cpMsg('now click the LEFT known peak on the graph')};
+$('selr').onclick=function(){calMode='right';cpMsg('now click the RIGHT known peak on the graph')};
+$('calcancel').onclick=function(){calClear();cpMsg('selection cancelled')};
+cv.addEventListener('click',function(e){
+  if(suppressClick){suppressClick=false;return} /* end of a pan drag */
+  if(!calMode)return;
+  var r=cv.getBoundingClientRect();
+  var x=(e.clientX-r.left)*(640/r.width);
+  /* map through the CURRENT view transform (zoom/pan), same as the cursor */
+  var px=Math.round(gX0+x/640*gSpan);
+  if(calMode==='left'){calref.p1=px;cpMsg('left = px '+px+'  ('+$('nm1').value+'nm) — pick right or apply',4000)}
+  else{calref.p2=px;cpMsg('right = px '+px+'  ('+$('nm2').value+'nm) — apply, pick left, or cancel',4000)}
+  calMode=null;
+});
+$('calapply').onclick=function(){
+  if(calref.p1===null||calref.p2===null){cpMsg('select BOTH peaks first');return}
+  fetch('/api/cal',
+    {method:'POST',headers:{'Content-Type':'text/plain'},
+     body:'px1='+calref.p1+'&w1='+$('nm1').value+'&px2='+calref.p2+'&w2='+$('nm2').value})
+  .then(function(r){return r.json()})
+  .then(function(d){DATA.cal=d.cal;calClear();
+    cpMsg('saved: px'+d.cal[0]+'->'+d.cal[1]+'nm, px'+d.cal[2]+'->'+d.cal[3]+'nm',4000);
+  }).catch(function(){cpMsg('cal save failed')});
+};
+$('calreset').onclick=function(){
+  calClear();
+  fetch('/api/cal',{method:'POST',body:'reset=1'})
+  .then(function(r){return r.json()})
+  .then(function(d){DATA.cal=d.cal;cpMsg('calibration reset')})
+  .catch(function(){cpMsg('reset failed')});
+};
+$('md').oninput=function(){$('v_md').textContent=this.value;
+  fetch('/api/settings',{method:'POST',body:'md='+this.value})};
+$('th').oninput=function(){$('v_th').textContent=this.value;
+  fetch('/api/settings',{method:'POST',body:'th='+this.value})};
+$('or').oninput=function(){$('v_or').textContent=this.value;
+  fetch('/api/settings',{method:'POST',body:'or='+this.value})};
+$('g').oninput=function(){$('v_g').textContent=this.value;DATA.g=+this.value;draw();
+  fetch('/api/settings',{method:'POST',body:'g='+this.value})};
+$('z').oninput=function(){$('v_z').textContent=this.value;VIEW.z=+this.value;draw()};
+$('p').oninput=function(){$('v_p').textContent=this.value;VIEW.p=+this.value;draw()};
+/* raw YUY2: applies at next stream open — confirmation dialog in label */
+$('raw').onchange=function(){
+  fetch('/api/cam',{method:'POST',body:'raw='+(this.checked?'1':'0')})
+    .then(function(r){return r.json()}).then(function(d){
+      $('v_raw').textContent=d.raw?'ON: waiting for restart...':'(no JPEG, ~2-3 fps)';
+    });
+};
+/* exposure: POST while dragging = control-transfer storm; only on release */
+$('exp').onchange=function(){
+  $('v_exp').textContent=this.value? (this.value/1000)+' ms' : 'auto';
+  fetch('/api/cam',{method:'POST',body:'exp='+this.value});
+};
+$('exp').oninput=function(){
+  $('v_exp').textContent=this.value? (this.value/1000)+' ms' : 'auto';
+};
+/* drag-to-pan: grab the graph and move it; the slider follows.
+ * A genuine drag suppresses the subsequent click so calibration picks
+ * don't fire at the end of a pan gesture. */
+var drag=null,suppressClick=false;
+cv.addEventListener('pointerdown',function(e){
+  var r=cv.getBoundingClientRect();
+  drag={x:(e.clientX-r.left)*(640/r.width),p:VIEW.p,moved:false};
+  e.preventDefault();
+});
+cv.addEventListener('pointermove',function(e){
+  if(!drag)return;
+  var r=cv.getBoundingClientRect();
+  var d=(e.clientX-r.left)*(640/r.width)-drag.x;
+  if(Math.abs(d)>3)drag.moved=true;
+  VIEW.p=drag.p-d*gSpan/640;   /* drag right moves content right */
+  draw();
+  $('p').value=Math.max(-320,Math.min(320,Math.round(VIEW.p)));
+  $('v_p').textContent=Math.round(VIEW.p);
+});
+window.addEventListener('pointerup',function(){
+  if(drag&&drag.moved)suppressClick=true;
+  drag=null;
+});
+/* wheel over the graph: zoom around the cursor (viewport chooser) */
+cv.addEventListener('wheel',function(e){
+  e.preventDefault();
+  var nz=Math.max(1,Math.min(8,VIEW.z*(e.deltaY<0?1.25:0.8)));
+  var r=cv.getBoundingClientRect();
+  var x=(e.clientX-r.left)*(640/r.width);
+  var gx=gX0+x/640*gSpan;      /* data index under the cursor stays put */
+  VIEW.z=nz;draw();
+  var span2=Math.max(1,DATA.n/VIEW.z);
+  var center=gx+(x/640-0.5)*span2;
+  VIEW.p=center-DATA.n/2;
+  draw();
+  $('z').value=VIEW.z;$('v_z').textContent=Math.round(VIEW.z*100)/100;
+  $('p').value=Math.max(-320,Math.min(320,Math.round(VIEW.p)));
+  $('v_p').textContent=Math.round(VIEW.p);
+},{passive:false});
+cv.addEventListener('mousemove',function(e){
+  var r=cv.getBoundingClientRect();
+  var x=(e.clientX-r.left)*(640/r.width);
+  var i=Math.round(gX0+x/640*gSpan);
+  if(i>=0&&i<DATA.n){
+    /* calibrated nm at the cursor when a cal exists, fixed ruler otherwise */
+    var nm;
+    if(DATA.cal[0]){
+      var c=DATA.cal;
+      nm=c[1]+(i-c[0])*(c[3]-c[1])/(c[2]-c[0]);
+    } else nm=wlOf(i);
+    $('cur').textContent=Math.round(nm)+'nm  '+(DATA.int[i]|0);
+  }
+  else $('cur').textContent='-';
+});
+$('hold').onclick=function(){
+  fetch('/api/settings',{method:'POST',body:'hold='+(!DATA.hold?1:0)})
+    .then(function(r){return r.json()}).then(function(d){DATA.hold=d.hold;
+    this.textContent='peak hold: '+(d.hold?'on':'off')}.bind(this))};
+$('rhold').onclick=function(){fetch('/api/settings',{method:'POST',body:'rhold=1'})
+  .then(function(r){return r.json()}).then(function(d){DATA.hold=d.hold})};
+$('netsave').onclick=function(){
+  var s=$('ssid').value.trim(),p=$('pass').value;
+  if(!s){$('netst').textContent='enter SSID';return}
+  $('netst').textContent='saving...';
+  fetch('/api/net',{method:'POST',body:'ssid='+encodeURIComponent(s)+'&pass='+encodeURIComponent(p)})
+    .then(function(){$('netst').textContent='saved — device will switch to STA';})
+    .catch(function(){$('netst').textContent='failed'});
+};
+function tick(){
+  fetch('/api/data').then(function(r){return r.json()}).then(function(d){
+    DATA=d;draw();
+    /* sliders + labels live-sync from device state: the firmware's stored
+     * settings differ from the HTML defaults, and unnoticed mismatch makes
+     * threshold/filter edits look dead until the user crosses the real value */
+    $('md').value=d.md;$('v_md').textContent=d.md;
+    $('th').value=d.th;$('v_th').textContent=d.th;
+    $('or').value=d.or;$('v_or').textContent=d.or;
+    $('g').value=d.g;$('v_g').textContent=d.g;
+    /* camera prefs sync (label only; checkbox checked unless focused) */
+    if(document.activeElement!==$('raw'))$('raw').checked=!!d.raw;
+    $('v_raw').textContent = d.raw
+      ? (d.fmt==='yuy2' ? 'ON: live @ '+d.w+'x'+d.h+', '+d.fps+'fps'
+                        : 'ON: waiting for restart...')
+      : '(no JPEG, ~2-3 fps)';
+    if(document.activeElement!==$('exp')) {
+      $('exp').value = d.exp;
+      $('v_exp').textContent = d.exp ? (d.exp/1000)+' ms' : 'auto';
+    }
+    /* nm inputs echo the device's active cal so the last-used values
+  * survive reloads — but never while the user types them, while a
+  * cal point-selection sequence is in progress, or when cal is reset */
+    if(calref.p1===null&&d.cal[0]){
+      if(document.activeElement!==$('nm1'))$('nm1').value=d.cal[1];
+      if(document.activeElement!==$('nm2'))$('nm2').value=d.cal[3];
+    }
+    /* idle status line: active cal (or none); cal-flow messages win via cpHoldUntil */
+    if(!calMode&&Date.now()>cpHoldUntil)
+      $('cp').textContent=d.cal[0]
+        ? 'cal: px'+d.cal[0]+'='+d.cal[1]+'nm, px'+d.cal[2]+'='+d.cal[3]+'nm'
+        : 'cal: none';
+  })
+    .catch(function(){$('st').textContent='connection lost'});
+}
+setInterval(tick,150);
+tick();
+</script>
+</body>
+</html>
+
