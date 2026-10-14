@@ -2,7 +2,7 @@
 
 An ESP32-S3 firmware that turns a cheap USB webcam (UVC) + diffraction-grating
 frontend into a working spectrometer — a port of
-[PySpectrometer](https://github.com/leswright1979/PySpectrometer) (v3.2) to
+[PySpectrometer](https://github.com/leswright1977/PySpectrometer) (v3.2) to
 ESP-IDF 5.5, with the spectrum served on a browser page over WiFi.
 
 ```
