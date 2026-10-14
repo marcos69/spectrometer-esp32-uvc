@@ -10,6 +10,8 @@ light -> slit -> grating -> webcam sensor -> ESP32-S3 (USB host, UVC)
       -> row DSP (Savitzky-Golay + peak find) -> web UI (live graph)
 ```
 
+![Spectrometer web UI](media/webui.png)
+
 ## Hardware
 
 | Part | Detail |
